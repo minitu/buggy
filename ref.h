@@ -71,11 +71,11 @@ typedef struct list_t {
 static list_t buckets[BUCKET_COUNT];
 
 /*
- * We could initialize theize of
+ * We could initialize the allocator by giving it one free block the size of
  * the entire address space. However, this would cause us to instantly reserve
  * half of the entire address space on the first allocation, since the first
  * split would store a free list entry at the start of the right child of the
- nstead, we have the tree start out small and grow the size of the
+ * root. Instead, we have the tree start out small and grow the size of the
  * tree as we use more memory. The size of the tree is tracked by this value.
  */
 static size_t bucket_limit;
@@ -86,7 +86,8 @@ static size_t bucket_limit;
  * bit in this array).
  *
  * Given the index for a node, lineraized binary trees allow you to traverse to
- * the parent node or the child nodes just by doing simple arithmetic on * rndex:
+ * the parent node or the child nodes just by doing simple arithmetic on the
+ * index:
  *
  * - Move to parent:         index = (index - 1) / 2;
  * - Move to left child:     index = index * 2 + 1;
@@ -99,7 +100,7 @@ static size_t bucket_limit;
  * - SPLIT (one child is UNUSED and the other child isn't)
  * - USED (neither children are UNUSED)
  *
- * These states take two bits to store. However, it turns out we have e:nough
+ * These states take two bits to store. However, it turns out we have enough
  * information to distinguish between UNUSED and USED from context, so we only
  * need to store SPLIT or not, which only takes a single bit.
  *

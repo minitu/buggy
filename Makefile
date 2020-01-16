@@ -1,7 +1,9 @@
+DEFS=-DDEBUG
+
 all: test
 
-test: test.cpp guddy.h
-	g++ -o $@ $< -I ./
+test: test.cu buggy.h
+	nvcc -std=c++11 -o $@ $< -I ./ $(DEFS)
 
 clean:
 	rm -f *.o test
