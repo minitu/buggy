@@ -17,22 +17,30 @@ namespace buggy {
 #endif
 
   struct allocator {
-    // Allocated block
-    struct Block {
+    // Free block
+    struct FreeBlock {
       uint8_t* ptr;
       size_t size;
 
-      Block() : ptr(nullptr), size(0) {}
+      FreeBlock() : ptr(nullptr), size(0) {}
 
-      Block(uint8_t* ptr, size_t size) {
-        this->ptr = ptr;
-        this->size = size;
-      }
+      FreeBlock(uint8_t* ptr_, size_t size_) : ptr(ptr_), size(size_) {}
+    };
+
+    // Allocated block - separately stores requested and allocated memory
+    // to track (internal) fragmentation. Does not contain the pointer as it
+    // is stored as a key in the unordered map.
+    struct AllocBlock {
+      size_t size;
+      size_t requested;
+
+      AllocBlock() : size(0), requested(0) {}
+
+      AllocBlock(size_t size_, size_t requested_) : size(size_), requested(requested_) {}
     };
 
     // Allocation limits
     size_t limit;
-    int limit_log2;
     const size_t min_alloc;
 
     // Base pointer of the initial allocation
@@ -42,11 +50,11 @@ namespace buggy {
     std::mutex mutex;
 
     // Buckets each with a free list
-    std::list<Block>* buckets;
+    std::list<FreeBlock>* buckets;
     int bucket_count;
 
     // Map of allocated blocks
-    std::unordered_map<uint8_t*, size_t> alloc_map;
+    std::unordered_map<uint8_t*, AllocBlock> alloc_map;
 
     /* --------------------- */
     /* | Utility functions | */
@@ -54,22 +62,35 @@ namespace buggy {
 
     void print_status() {
       printf("(buckets)\n");
+      size_t free = 0;
       for (int i = 0; i < bucket_count; i++) {
         printf("bucket[%d]: ", i);
         for (const auto& block : buckets[i]) {
+          free += block.size;
           printf("{%p, %lu} ", block.ptr, block.size);
         }
         printf("\n");
       }
 
       printf("(alloc_map)\n");
+      size_t allocated = 0;
+      size_t used = 0;
       for (const auto& elem : alloc_map) {
-        printf("ptr: %p, size: %lu\n", elem.first, elem.second);
+        const auto& block = elem.second;
+        allocated += block.size;
+        used += block.requested;
+        printf("ptr: %p, size: %lu, req: %lu\n", elem.first, block.size, block.requested);
       }
+
+      printf("(fragmentation) free: %lu, allocated: %lu, used: %lu\n", free, allocated, used);
     }
 
     int get_bucket(size_t size) {
       return (int)std::ceil(std::log2((double)size)) - 2;
+    }
+
+    int get_buddy(uint8_t* ptr, size_t size) {
+      return (size_t)(ptr - base_ptr) / size;
     }
 
     /* ------------------------ */
@@ -78,18 +99,19 @@ namespace buggy {
 
     allocator(size_t size = 1 << 26) : min_alloc(4), base_ptr(NULL) {
       // Request GPU memory (closest power of 2)
-      limit_log2 = std::ceil(std::log2((double)size));
+      int limit_log2 = std::ceil(std::log2((double)size));
       limit = (size_t)std::pow(2, limit_log2);
       cudaMalloc(&base_ptr, limit);
       DEBUG_PRINT("Initialized base_ptr %p with %lu bytes\n", (void*)base_ptr, limit);
 
       // Initialize buckets and set up last bucket (for size min_alloc)
       bucket_count = limit_log2 - 1;
-      buckets = new std::list<Block>[bucket_count];
+      buckets = new std::list<FreeBlock>[bucket_count];
       buckets[bucket_count-1].emplace_back(base_ptr, limit);
     }
 
     ~allocator() {
+      // Free GPU memory
       cudaFree(base_ptr);
       delete[] buckets;
     }
@@ -97,10 +119,11 @@ namespace buggy {
     void* malloc(size_t request) {
       const std::lock_guard<std::mutex> lock(mutex);
 
-      // Must be initialized
-      if (!base_ptr) return nullptr;
+      // Cannot satisfy request larger than limit
+      if (request > limit) return nullptr;
 
-      int bucket = get_bucket(request);
+      size_t alloc_size = (request > min_alloc) ? request : min_alloc;
+      int bucket = get_bucket(alloc_size);
       int original_bucket = bucket;
 
       // Find an empty bucket
@@ -115,23 +138,29 @@ namespace buggy {
       }
 
       // Found bucket with free block, take it and start splitting if needed
-      Block& block = buckets[bucket].back();
+      FreeBlock& block = buckets[bucket].front();
       uint8_t* ptr = block.ptr;
       size_t size = block.size;
-      buckets[bucket].pop_back();
+      buckets[bucket].pop_front();
 
       while (bucket-- > original_bucket) {
         buckets[bucket].emplace_back(ptr, size / 2);
+        buckets[bucket].emplace_back(ptr + size / 2, size / 2);
 
-        ptr += size / 2;
-        size /= 2;
+        block = buckets[bucket].front();
+        ptr = block.ptr;
+        size = block.size;
+        buckets[bucket].pop_front();
       }
 
       // Store allocation info
-      alloc_map.insert({ptr, size});
+      alloc_map.emplace(
+          std::piecewise_construct,
+          std::forward_as_tuple(ptr),
+          std::forward_as_tuple(size, request));
 
-      DEBUG_PRINT("Allocated ptr %p (base_ptr + %lu) with %lu bytes\n",
-          (void*)ptr, (size_t)(ptr - base_ptr), size);
+      DEBUG_PRINT("Allocated ptr %p (base_ptr + %lu) with %lu bytes, requested %lu bytes\n",
+          (void*)ptr, (size_t)(ptr - base_ptr), size, request);
 
 #ifdef DEBUG
       print_status();
@@ -144,17 +173,56 @@ namespace buggy {
       const std::lock_guard<std::mutex> lock(mutex);
 
       // Find pointer in allocation map
-      auto search = alloc_map.find((uint8_t*)ptr);
-      if (search == alloc_map.end()) {
+      auto alloc_it = alloc_map.find((uint8_t*)ptr);
+      if (alloc_it == alloc_map.end()) {
         fprintf(stderr, "Free invalid pointer: %p\n", ptr);
         std::abort();
       }
 
-      size_t size = search->second;
+      const auto& alloc_block = alloc_it->second;
+      size_t size = alloc_block.size;
       int bucket = get_bucket(size);
 
       // Add to free list
       buckets[bucket].emplace_back((uint8_t*)ptr, size);
+
+      // Remove entry from allocation map
+      alloc_map.erase(alloc_it);
+
+      // Recursively merge free blocks
+      uint8_t* merge_ptr = (uint8_t*)ptr;
+      for (int i = bucket; i < bucket_count; i++) {
+
+        // Find buddy of current block
+        int buddy_number = get_buddy(merge_ptr, size);
+        bool buddy_number_even = (buddy_number % 2 == 0);
+        uint8_t* buddy_ptr = buddy_number_even ? (merge_ptr + size) : (merge_ptr - size);
+
+        // If buddy is also free, merge
+        for (std::list<FreeBlock>::iterator it = buckets[i].begin(); it != buckets[i].end(); it++) {
+          const auto& block = *it;
+          if (block.ptr == buddy_ptr) {
+            buckets[i+1].emplace_back(buddy_number_even ? merge_ptr : buddy_ptr, 2 * size);
+            buckets[i].erase(it); // Iterator is invalid after this erase
+            buckets[i].pop_back();
+            break;
+          }
+          else {
+            // Did not find free buddy block, no more merging to be done
+            goto merge_done;
+          }
+        }
+
+        if (!buddy_number_even) merge_ptr = buddy_ptr;
+        size *= 2;
+      }
+
+merge_done:
+      DEBUG_PRINT("Freed ptr %p\n", ptr);
+
+#ifdef DEBUG
+      print_status();
+#endif
     }
   }; // struct allocator
 

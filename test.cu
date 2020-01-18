@@ -6,6 +6,7 @@ void test(buggy::allocator& buggy_alloc) {
   double* b = (double*)buggy_alloc.malloc(sizeof(double) * 100);
 
   buggy_alloc.free(a);
+  buggy_alloc.free(b);
 }
 
 int main() {
